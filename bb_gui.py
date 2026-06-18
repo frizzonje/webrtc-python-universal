@@ -14,15 +14,15 @@ GUI общается с ним через потокобезопасную оч�
 from __future__ import annotations
 
 import queue
+import subprocess
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, ttk
 
 from bb_native import (
     Engine,
     MODE_PRESETS,
     apply_mode_defaults,
     build_arg_parser,
-    list_audio,
     setup_sink,
 )
 
@@ -54,6 +54,23 @@ def _entry(parent, show=None):
                  insertbackground=C["text"], highlightthickness=1,
                  highlightbackground=C["dark"], highlightcolor=C["accent"], show=show)
     return e
+
+
+def _combo(parent, values, initial=""):
+    style = ttk.Style(parent)
+    style.theme_use("default")
+    style.configure("Dark.TCombobox",
+                    fieldbackground=C["field"], background=C["card"],
+                    foreground=C["text"], selectbackground=C["accent"],
+                    selectforeground=C["text"], arrowcolor=C["muted"],
+                    insertcolor=C["text"])
+    style.map("Dark.TCombobox",
+              fieldbackground=[("readonly", C["field"])],
+              foreground=[("readonly", C["text"])],
+              selectbackground=[("readonly", C["accent"])])
+    c = ttk.Combobox(parent, values=values, style="Dark.TCombobox", font=FONT_SM)
+    c.set(initial if initial else (values[0] if values else ""))
+    return c
 
 
 def _label(parent, text, fg=None, font=FONT):
@@ -101,6 +118,28 @@ class App:
         for w in self.body.winfo_children():
             w.destroy()
 
+    def _get_audio_devices(self):
+        sources, sinks = ["default"], [None]
+        try:
+            r = subprocess.run(["pactl", "list", "short", "sources"],
+                               capture_output=True, text=True, timeout=3)
+            names = [ln.split("\t")[1] for ln in r.stdout.strip().splitlines()
+                     if len(ln.split("\t")) >= 2]
+            if names:
+                sources = names
+        except Exception:
+            pass
+        try:
+            r = subprocess.run(["pactl", "list", "short", "sinks"],
+                               capture_output=True, text=True, timeout=3)
+            names = [ln.split("\t")[1] for ln in r.stdout.strip().splitlines()
+                     if len(ln.split("\t")) >= 2]
+            if names:
+                sinks = names
+        except Exception:
+            pass
+        return sources, sinks
+
     # ── экран «подключиться» ──────────────────────────────────────────────
     def _show_connect(self):
         self._clear_body()
@@ -125,13 +164,33 @@ class App:
         _label(rcol, "Имя").pack(fill="x", pady=(10, 2))
         self.f_name = _entry(rcol); self.f_name.insert(0, self.args.name); self.f_name.pack(fill="x", ipady=4)
 
+        # аудио-устройства
+        sources, sinks = self._get_audio_devices()
+        audio_row = tk.Frame(self.body, bg=C["bg"]); audio_row.pack(fill="x")
+        mcol = tk.Frame(audio_row, bg=C["bg"]); mcol.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        scol = tk.Frame(audio_row, bg=C["bg"]); scol.pack(side="left", fill="x", expand=True, padx=(6, 0))
+
+        _label(mcol, "🎤 Микрофон").pack(fill="x", pady=(10, 2))
+        mic_init = self.args.mic_source if self.args.mic_source in sources else (sources[0] if sources else "default")
+        self.f_mic = _combo(mcol, sources, mic_init)
+        self.f_mic.pack(fill="x", ipady=3)
+
+        _label(scol, "🎧 Наушники / колонки").pack(fill="x", pady=(10, 2))
+        sink_init = self.args.play_sink if self.args.play_sink in sinks else (sinks[0] if sinks else "")
+        self.f_sink = _combo(scol, sinks, sink_init or "")
+        self.f_sink.pack(fill="x", ipady=3)
+
+        # кнопка обновить список устройств
+        _btn(self.body, "↻ Обновить список устройств", self._refresh_audio_combos,
+             C["card"], "#404249", font=FONT_SM).pack(fill="x", pady=(4, 0))
+
         # звук системы
         self.sys_on = tk.BooleanVar(value=not self.args.no_system_audio)
         sc = tk.Checkbutton(self.body, text="  Транслировать звук системы (игра/музыка)",
                             variable=self.sys_on, bg=C["bg"], fg=C["text"], font=FONT_SM,
                             selectcolor=C["field"], activebackground=C["bg"],
                             activeforeground=C["text"], anchor="w", bd=0, highlightthickness=0)
-        sc.pack(fill="x", pady=(14, 2))
+        sc.pack(fill="x", pady=(12, 2))
         self.f_sys = _entry(self.body); self.f_sys.insert(0, self.args.system_source)
         self.f_sys.pack(fill="x", ipady=3)
 
@@ -145,17 +204,14 @@ class App:
         _btn(self.body, "Войти в канал", self._connect, C["green"], C["green_hi"],
              font=("DejaVu Sans", 12, "bold")).pack(fill="x", pady=(18, 6), ipady=2)
 
-        # утилиты звука
-        util = tk.Frame(self.body, bg=C["bg"]); util.pack(fill="x")
-        _btn(util, "🔊 Устройства", self._popup_audio, C["card"], "#404249",
-             font=FONT_SM).pack(side="left", expand=True, fill="x", padx=(0, 4))
-        _btn(util, "🎚 Анти-эхо", self._do_setup_sink, C["card"], "#404249",
-             font=FONT_SM).pack(side="left", expand=True, fill="x", padx=(4, 0))
+        # утилита анти-эхо
+        _btn(self.body, "🎚 Анти-эхо", self._do_setup_sink, C["card"], "#404249",
+             font=FONT_SM).pack(fill="x")
 
     def _render_segment(self, parent, live: bool):
         for w in parent.winfo_children():
             w.destroy()
-        defs = [("quality", "🎬 Качество", "1080p · 30"), ("fps", "⚡ ФПС", "720p · 60")]
+        defs = [("quality", "🎬 Качество", "1080p · 60"), ("fps", "⚡ ФПС", "720p · 60")]
         for key, title, sub in defs:
             active = self.mode.get() == key
             cell = tk.Frame(parent, bg=C["accent"] if active else C["card"], cursor="hand2")
@@ -166,6 +222,19 @@ class App:
                      font=FONT_SM).pack(pady=(0, 8))
             for wdg in (cell, *cell.winfo_children()):
                 wdg.bind("<Button-1>", lambda e, k=key, lv=live: self._pick_mode(k, lv))
+
+    def _refresh_audio_combos(self):
+        sources, sinks = self._get_audio_devices()
+        if hasattr(self, "f_mic") and self.f_mic.winfo_exists():
+            cur_mic = self.f_mic.get()
+            self.f_mic["values"] = sources
+            if cur_mic not in sources and sources:
+                self.f_mic.set(sources[0])
+        if hasattr(self, "f_sink") and self.f_sink.winfo_exists():
+            cur_sink = self.f_sink.get()
+            self.f_sink["values"] = sinks
+            if cur_sink not in sinks and sinks:
+                self.f_sink.set(sinks[0])
 
     def _pick_mode(self, key, live):
         if self.mode.get() == key:
@@ -228,6 +297,8 @@ class App:
         a.password = self.f_pass.get()
         a.room = self.f_room.get().strip() or "general"
         a.name = self.f_name.get().strip() or "Боец"
+        a.mic_source = self.f_mic.get().strip() or "default"
+        a.play_sink = self.f_sink.get().strip() or None
         a.system_source = self.f_sys.get().strip() or "@DEFAULT_MONITOR@"
         a.no_system_audio = not self.sys_on.get()
         a.mode = self.mode.get()
@@ -250,17 +321,6 @@ class App:
         self._refresh_mic_btn()
         if self.engine:
             self.engine.set_mic(self.mic_on)
-
-    def _popup_audio(self):
-        import io
-        import contextlib
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            try:
-                list_audio()
-            except Exception as e:  # noqa: BLE001
-                print(f"Ошибка: {e}\n(нужен pactl: apt install pulseaudio-utils)")
-        self._text_popup("Аудио-устройства", buf.getvalue())
 
     def _do_setup_sink(self):
         if not messagebox.askyesno("Анти-эхо",
