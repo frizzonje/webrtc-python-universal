@@ -2,3 +2,5 @@ aiortc>=1.9
 python-socketio>=5.11
 aiohttp>=3.9
 av>=11
+sounddevice>=0.4
+numpy>=1.24

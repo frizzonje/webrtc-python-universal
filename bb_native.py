@@ -58,8 +58,92 @@ EventCb = Callable[[str, object], None]
 
 MODE_PRESETS = {
     "quality": (1920, 1080, 60),  # упор на детализацию
-    "fps": (1280, 720, 60),       # упор на плавность
+    "fps": (1280, 720, 30),       # упор на плавность (меньше нагрузка на CPU)
 }
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Платформа. На Linux захват идёт через x11grab/pulse, на macOS — через
+# avfoundation, проигрывание входящего голоса — через sounddevice (кросс-платф).
+# ─────────────────────────────────────────────────────────────────────────
+
+IS_MAC = sys.platform == "darwin"
+IS_LINUX = sys.platform.startswith("linux")
+
+
+def _ffmpeg_bin() -> str:
+    return shutil.which("ffmpeg") or "ffmpeg"
+
+
+def avf_list_devices():
+    """macOS: список устройств avfoundation.
+
+    Возвращает (video, audio), где каждый — список (index:int, name:str).
+    video = экраны/камеры (для демонстрации), audio = микрофоны/мониторы.
+    """
+    video: List = []
+    audio: List = []
+    if not IS_MAC:
+        return video, audio
+    try:
+        r = subprocess.run(
+            [_ffmpeg_bin(), "-hide_banner", "-f", "avfoundation",
+             "-list_devices", "true", "-i", ""],
+            capture_output=True, text=True, timeout=8,
+        )
+        out = r.stderr or ""
+    except Exception:  # noqa: BLE001
+        return video, audio
+    section = None
+    for ln in out.splitlines():
+        if "AVFoundation video devices" in ln:
+            section = "v"
+            continue
+        if "AVFoundation audio devices" in ln:
+            section = "a"
+            continue
+        m = re.search(r"\]\s+\[(\d+)\]\s+(.+?)\s*$", ln)
+        if m and section:
+            idx, name = int(m.group(1)), m.group(2)
+            (video if section == "v" else audio).append((idx, name))
+    return video, audio
+
+
+def mac_screen_permission(request: bool = False) -> bool:
+    """macOS: есть ли разрешение «Запись экрана» у текущего процесса.
+
+    Без него avfoundation не отдаёт кадры (зависает), поэтому проверяем заранее.
+    request=True — попутно показать системный диалог запроса (один раз).
+    Если проверить не удалось — возвращаем True, чтобы не мешать.
+    """
+    if not IS_MAC:
+        return True
+    try:
+        import ctypes
+        cg = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+        if request and hasattr(cg, "CGRequestScreenCaptureAccess"):
+            cg.CGRequestScreenCaptureAccess.restype = ctypes.c_bool
+            cg.CGRequestScreenCaptureAccess()
+        if hasattr(cg, "CGPreflightScreenCaptureAccess"):
+            cg.CGPreflightScreenCaptureAccess.restype = ctypes.c_bool
+            return bool(cg.CGPreflightScreenCaptureAccess())
+    except Exception:  # noqa: BLE001
+        return True
+    return True
+
+
+def sd_output_devices():
+    """Список (index:int, name:str) устройств вывода для проигрывания голоса."""
+    try:
+        import sounddevice as sd
+        outs = []
+        for i, d in enumerate(sd.query_devices()):
+            if d.get("max_output_channels", 0) > 0:
+                outs.append((i, d["name"]))
+        return outs
+    except Exception:  # noqa: BLE001
+        return []
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -152,38 +236,77 @@ class Capture:
         self.screen_src = None
         self.sys_src = None
         self._screen_player = None
+        self._mic_player = None
+        self._sys_player = None
         self.display = args.display
         self.w, self.h, self.fps = args.width, args.height, args.fps
 
-        # --- Экран (x11grab) --- без него смысла нет → это фатально
+        # --- Экран --- без него смысла нет → это фатально
         self._start_screen(self.w, self.h, self.fps)
 
-        # --- Микрофон (pulse) ---
+        # --- Микрофон ---
         if not args.no_mic:
             try:
-                p = MediaPlayer(args.mic_source, format="pulse",
-                                options={"sample_rate": "48000", "channels": "1"})
-                self.mic_src = p.audio
-                self.log("log", f"[mic] pulse '{args.mic_source}'")
+                self._mic_player = self._open_mic()
+                self.mic_src = self._mic_player.audio
+                self.log("log", f"[mic] {args.mic_source}")
             except Exception as e:  # noqa: BLE001
                 self.log("log", f"[mic] недоступен ({e}) — без микрофона")
 
-        # --- Звук системы / игры (pulse monitor) ---
-        if not args.no_system_audio:
+        # --- Звук системы / игры ---
+        if not args.no_system_audio and args.system_source:
             try:
-                p = MediaPlayer(args.system_source, format="pulse",
-                                options={"sample_rate": "48000", "channels": "2"})
-                self.sys_src = p.audio
-                self.log("log", f"[sysaudio] pulse '{args.system_source}'")
+                self._sys_player = self._open_system()
+                self.sys_src = self._sys_player.audio
+                self.log("log", f"[sysaudio] {args.system_source}")
             except Exception as e:  # noqa: BLE001
                 self.log("log", f"[sysaudio] недоступен ({e}) — без звука системы")
 
-    def _start_screen(self, w, h, fps):
+    # --- открытие источников по платформе ---------------------------------
+    def _open_mic(self):
+        if IS_MAC:
+            return MediaPlayer(f":{self.args.mic_source}", format="avfoundation",
+                               options={"sample_rate": "48000", "channels": "1"})
+        return MediaPlayer(self.args.mic_source, format="pulse",
+                           options={"sample_rate": "48000", "channels": "1"})
+
+    def _open_system(self):
+        if IS_MAC:
+            return MediaPlayer(f":{self.args.system_source}", format="avfoundation",
+                               options={"sample_rate": "48000", "channels": "2"})
+        return MediaPlayer(self.args.system_source, format="pulse",
+                           options={"sample_rate": "48000", "channels": "2"})
+
+    def _open_screen(self, w, h, fps):
+        if IS_MAC:
+            # avfoundation захватывает экран в нативном разрешении; режим меняет
+            # частоту кадров (и битрейт), масштабирование тут недоступно.
+            opts = {"framerate": str(fps), "capture_cursor": "1"}
+            return MediaPlayer(f"{self.args.screen_source}:none",
+                               format="avfoundation", options=opts)
         opts = {"video_size": f"{w}x{h}", "framerate": str(fps),
                 "draw_mouse": "1", "probesize": "32", "thread_queue_size": "512"}
+        return MediaPlayer(self.display, format="x11grab", options=opts)
+
+    def _start_screen(self, w, h, fps):
+        # На macOS без разрешения «Запись экрана» avfoundation просто зависает,
+        # не отдавая кадры. Поэтому проверяем заранее и сразу сообщаем понятно.
+        if IS_MAC and not mac_screen_permission(request=True):
+            raise CaptureError(
+                "Нет доступа к «Записи экрана». Разреши его приложению, из которого "
+                "запущен клиент (обычно «Терминал» или «Python»):\n\n"
+                "Системные настройки → Конфиденциальность и безопасность → "
+                "Запись экрана → включи галочку, затем перезапусти клиент.")
         try:
-            p = MediaPlayer(self.display, format="x11grab", options=opts)
+            p = self._open_screen(w, h, fps)
         except Exception as e:  # noqa: BLE001
+            if IS_MAC:
+                raise CaptureError(
+                    f"Не удалось захватить экран (источник «{self.args.screen_source}»): {e}\n\n"
+                    "Разреши «Запись экрана» приложению, из которого запущен клиент "
+                    "(Системные настройки → Конфиденциальность и безопасность → Запись экрана), "
+                    "и перезапусти клиент."
+                ) from e
             raise CaptureError(
                 f"Не удалось захватить экран ({self.display}, {w}x{h}@{fps}): {e}. "
                 f"На Wayland войдите в сессию «Ubuntu on Xorg» — см. README."
@@ -191,7 +314,8 @@ class Capture:
         self._screen_player = p
         self.screen_src = p.video
         self.w, self.h, self.fps = w, h, fps
-        self.log("log", f"[screen] x11grab {self.display} {w}x{h}@{fps}")
+        src = self.args.screen_source if IS_MAC else self.display
+        self.log("log", f"[screen] {src} @{fps}")
 
     def restart_screen(self, w, h, fps):
         old = self._screen_player
@@ -228,42 +352,53 @@ class Capture:
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Проигрывание входящего голоса собеседников через pacat (PulseAudio).
+# Проигрывание входящего голоса собеседников через sounddevice (PortAudio) —
+# работает одинаково на macOS и Linux. sink = индекс/имя устройства вывода
+# (None → системное по умолчанию).
 # ─────────────────────────────────────────────────────────────────────────
 
 class Playback:
-    def __init__(self, sink: Optional[str], log: EventCb):
-        self.sink = sink
+    def __init__(self, sink, log: EventCb):
+        self.sink = sink  # int|str|None — устройство sounddevice
         self.log = log
-        self.have_pacat = shutil.which("pacat") is not None
-        if not self.have_pacat:
-            self.log("log", "[play] pacat не найден (apt install pulseaudio-utils) — "
+        try:
+            import sounddevice as sd
+            self.sd = sd
+            import numpy as np
+            self.np = np
+        except Exception as e:  # noqa: BLE001
+            self.sd = None
+            self.np = None
+            self.log("log", f"[play] sounddevice/numpy недоступны ({e}) — "
                             "вы НЕ услышите собеседников")
 
     async def play_track(self, track):
-        if not self.have_pacat:
+        if self.sd is None:
             try:
                 while True:
                     await track.recv()
             except Exception:  # noqa: BLE001
-                return
+                pass
             return
-        cmd = ["pacat", "--playback", "--rate=48000", "--channels=2",
-               "--format=s16le", "--latency-msec=40", "--client-name=bb-native"]
-        if self.sink:
-            cmd.append(f"--device={self.sink}")
-        proc = await asyncio.create_subprocess_exec(*cmd, stdin=asyncio.subprocess.PIPE)
+        loop = asyncio.get_event_loop()
+        try:
+            stream = self.sd.OutputStream(samplerate=48000, channels=2, dtype="int16",
+                                          device=self.sink, blocksize=0, latency="low")
+            stream.start()
+        except Exception as e:  # noqa: BLE001
+            self.log("log", f"[play] не открыть устройство вывода ({e})")
+            return
         resampler = av.AudioResampler(format="s16", layout="stereo", rate=48000)
         try:
             while True:
                 frame = await track.recv()
                 for r in resampler.resample(frame):
-                    proc.stdin.write(bytes(r.planes[0]))
-                    await proc.stdin.drain()
+                    data = r.to_ndarray().reshape(-1, 2)
+                    await loop.run_in_executor(None, stream.write, data)
         except Exception:  # noqa: BLE001 — дорожка кончилась/закрылась
             pass
         finally:
-            for fn in (proc.stdin.close, proc.terminate):
+            for fn in (stream.stop, stream.close):
                 try:
                     fn()
                 except Exception:  # noqa: BLE001
@@ -609,7 +744,34 @@ class Engine:
 # Вспомогательные команды по аудио (диагностика и анти-эхо setup).
 # ─────────────────────────────────────────────────────────────────────────
 
+def find_blackhole():
+    """macOS: (index_str, name) виртуального устройства BlackHole или (None, None)."""
+    _, auds = avf_list_devices()
+    for idx, name in auds:
+        if "blackhole" in name.lower():
+            return str(idx), name
+    return None, None
+
+
 def list_audio():
+    if IS_MAC:
+        vids, auds = avf_list_devices()
+        print("=== ЭКРАНЫ / КАМЕРЫ (для демонстрации, --screen-source) ===")
+        for idx, name in vids:
+            print(f"  [{idx}] {name}")
+        print("\n=== АУДИО-ВХОДЫ (микрофон/звук системы) ===")
+        for idx, name in auds:
+            print(f"  [{idx}] {name}")
+        print("\n=== ВЫХОДЫ (наушники/колонки, --play-sink) ===")
+        for idx, name in sd_output_devices():
+            print(f"  [{idx}] {name}")
+        bh, bhname = find_blackhole()
+        print("\nЗвук системы на macOS: установи BlackHole (brew install blackhole-2ch),"
+              if not bh else f"\nЗвук системы: найден «{bhname}» (--system-source {bh}).")
+        if not bh:
+            print("создай Multi-Output Device в «Audio MIDI Setup» и выбери BlackHole "
+                  "источником системного звука.")
+        return
     print("=== ИСТОЧНИКИ (sources, для микрофона/захвата) ===")
     subprocess.run(["pactl", "list", "short", "sources"], check=False)
     print("\n=== ПРИЁМНИКИ (sinks, для проигрывания) ===")
@@ -618,6 +780,22 @@ def list_audio():
 
 
 def setup_sink():
+    if IS_MAC:
+        bh, bhname = find_blackhole()
+        if bh:
+            print(f"BlackHole уже установлен: «{bhname}» (индекс {bh}).\n\n"
+                  "Чтобы транслировать звук системы И слышать его самому:\n"
+                  "  1) Открой «Audio MIDI Setup» (Настройка Audio-MIDI).\n"
+                  "  2) ➕ → «Создать устройство с несколькими выходами» (Multi-Output Device).\n"
+                  "  3) Отметь там свои наушники/колонки И BlackHole 2ch.\n"
+                  "  4) Сделай это Multi-Output устройством вывода системы.\n"
+                  f"  5) В клиенте выбери источник звука системы = «{bhname}».\n")
+        else:
+            print("BlackHole не найден. Установи виртуальное аудио-устройство:\n\n"
+                  "  brew install blackhole-2ch\n\n"
+                  "После установки перезапусти клиент и выполни ещё раз эту подсказку.\n"
+                  "BlackHole нужен, потому что macOS не даёт захватывать звук системы напрямую.\n")
+        return
     print("Создаю виртуальный sink 'bb_stream' + loopback на ваш звук…")
     subprocess.run(["pactl", "load-module", "module-null-sink", "sink_name=bb_stream",
                     "sink_properties=device.description=BB_Stream"], check=False)
@@ -641,7 +819,7 @@ def _default_display() -> str:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(description="Нативный WebRTC-клиент «Белой Берёзки» (Linux)")
+    ap = argparse.ArgumentParser(description="Нативный WebRTC-клиент «Белой Берёзки» (macOS/Linux)")
     ap.add_argument("--server", default=os.environ.get("BB_SERVER", "https://192.168.0.138"))
     ap.add_argument("--password", default=os.environ.get("BB_PASSWORD", "123"))
     ap.add_argument("--room", default="general")
@@ -653,8 +831,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--start-bitrate", type=int, default=4000)
     ap.add_argument("--max-bitrate", type=int, default=8000)
     ap.add_argument("--display", default=_default_display())
-    ap.add_argument("--mic-source", default="default")
-    ap.add_argument("--system-source", default="@DEFAULT_MONITOR@")
+    # источники: на macOS это индексы avfoundation, на Linux — display / pulse-имена.
+    # None → разрешаем автоматически в apply_source_defaults().
+    ap.add_argument("--screen-source", default=None)
+    ap.add_argument("--mic-source", default=None)
+    ap.add_argument("--system-source", default=None)
     ap.add_argument("--play-sink", default=None)
     ap.add_argument("--no-mic", action="store_true")
     ap.add_argument("--no-system-audio", action="store_true")
@@ -671,6 +852,37 @@ def apply_mode_defaults(args):
     args.width = args.width or w
     args.height = args.height or h
     args.fps = args.fps or fps
+    return args
+
+
+def apply_source_defaults(args):
+    """Подставить источники захвата по платформе, если не заданы явно.
+
+    macOS: индексы avfoundation (экран, микрофон, звук системы = BlackHole).
+    Linux: display + pulse-имена.
+    """
+    if IS_MAC:
+        vids, auds = avf_list_devices()
+        if args.screen_source is None:
+            args.screen_source = next(
+                (str(i) for i, n in vids if "capture screen" in n.lower()),
+                str(vids[-1][0]) if vids else "1")
+        if args.mic_source is None:
+            args.mic_source = next(
+                (str(i) for i, n in auds if "blackhole" not in n.lower()),
+                str(auds[0][0]) if auds else "0")
+        if args.system_source is None:
+            bh, _ = find_blackhole()
+            args.system_source = bh or ""
+            if not bh:
+                args.no_system_audio = True
+    else:
+        if args.screen_source is None:
+            args.screen_source = args.display
+        if args.mic_source is None:
+            args.mic_source = "default"
+        if args.system_source is None:
+            args.system_source = "@DEFAULT_MONITOR@"
     return args
 
 
@@ -709,6 +921,7 @@ def main():
         setup_sink()
         return
     apply_mode_defaults(args)
+    apply_source_defaults(args)
     print("══════════════════════════════════════════════════════")
     print("  Белая Берёзка — нативный клиент (CLI)")
     print(f"  сервер: {args.server}   канал: {args.room}   имя: {args.name}")

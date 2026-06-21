@@ -20,9 +20,14 @@ from tkinter import messagebox, ttk
 
 from bb_native import (
     Engine,
+    IS_MAC,
     MODE_PRESETS,
     apply_mode_defaults,
+    apply_source_defaults,
+    avf_list_devices,
     build_arg_parser,
+    find_blackhole,
+    sd_output_devices,
     setup_sink,
 )
 
@@ -33,10 +38,12 @@ C = {
     "green": "#23a55a", "green_hi": "#1a8546", "red": "#da373c", "red_hi": "#a12828",
     "field": "#1e1f22", "online": "#23a55a", "off": "#80848e",
 }
-FONT = ("DejaVu Sans", 11)
-FONT_SM = ("DejaVu Sans", 9)
-FONT_BIG = ("DejaVu Sans", 16, "bold")
-FONT_MONO = ("DejaVu Sans Mono", 8)
+_UI = "Helvetica Neue" if IS_MAC else "DejaVu Sans"
+_MONO = "Menlo" if IS_MAC else "DejaVu Sans Mono"
+FONT = (_UI, 12 if IS_MAC else 11)
+FONT_SM = (_UI, 11 if IS_MAC else 9)
+FONT_BIG = (_UI, 17 if IS_MAC else 16, "bold")
+FONT_MONO = (_MONO, 10 if IS_MAC else 8)
 
 
 def _btn(parent, text, cmd, bg, hi, fg="#ffffff", font=FONT, **kw):
@@ -84,13 +91,19 @@ class App:
         self.args = args
         self.engine = None
         self.q: "queue.Queue" = queue.Queue()
+        # разрешаем источники сразу — чтобы выпадашки заранее выбрали экран
+        # (а не камеру), нужный микрофон и BlackHole, если он есть.
+        try:
+            apply_source_defaults(args)
+        except Exception:  # noqa: BLE001
+            pass
         self.mic_on = not args.no_mic
         self.mode = tk.StringVar(value=args.mode)
 
         root.title("Белая Берёзка — нативка")
         root.configure(bg=C["bg"])
-        root.geometry("460x640")
-        root.minsize(420, 560)
+        root.geometry("480x770")
+        root.minsize(440, 680)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._build_header()
@@ -108,7 +121,7 @@ class App:
         inner.pack(fill="x", padx=16, pady=12)
         tk.Label(inner, text="🌳 Белая Берёзка", bg=C["panel"], fg=C["text"],
                  font=FONT_BIG).pack(side="left")
-        self.dot = tk.Label(inner, text="●", bg=C["panel"], fg=C["off"], font=("DejaVu Sans", 13))
+        self.dot = tk.Label(inner, text="●", bg=C["panel"], fg=C["off"], font=(_UI, 14))
         self.dot.pack(side="right")
         self.status = tk.Label(inner, text="не в эфире", bg=C["panel"], fg=C["muted"],
                                font=FONT_SM)
@@ -118,8 +131,22 @@ class App:
         for w in self.body.winfo_children():
             w.destroy()
 
-    def _get_audio_devices(self):
-        sources, sinks = ["default"], [None]
+    def _enum_sources(self):
+        """Источники для выпадашек: каждый — список (label, value).
+
+        screens — что показывать (экраны/камеры); mics — микрофон;
+        sysaud — звук системы (первый пункт «выкл»); outs — куда играть голос.
+        """
+        if IS_MAC:
+            vids, auds = avf_list_devices()
+            screens = [(n, str(i)) for i, n in vids] or [("Экран", "1")]
+            mics = [(n, str(i)) for i, n in auds] or [("Микрофон", "0")]
+            sysaud = [("— не транслировать —", "")] + [(n, str(i)) for i, n in auds]
+            outs = [("Системное по умолчанию", None)] + \
+                   [(n, i) for i, n in sd_output_devices()]
+            return screens, mics, sysaud, outs
+        # Linux: экран = $DISPLAY, аудио из pulse
+        sources, sinks = ["default"], []
         try:
             r = subprocess.run(["pactl", "list", "short", "sources"],
                                capture_output=True, text=True, timeout=3)
@@ -134,11 +161,21 @@ class App:
                                capture_output=True, text=True, timeout=3)
             names = [ln.split("\t")[1] for ln in r.stdout.strip().splitlines()
                      if len(ln.split("\t")) >= 2]
-            if names:
-                sinks = names
+            sinks = names
         except Exception:
             pass
-        return sources, sinks
+        screens = [(f"Экран {self.args.display}", self.args.display)]
+        mics = [(n, n) for n in sources]
+        sysaud = [("— не транслировать —", "")] + \
+                 [("@DEFAULT_MONITOR@", "@DEFAULT_MONITOR@")] + \
+                 [(n, n) for n in sources if ".monitor" in n]
+        outs = [("Системное по умолчанию", None)] + [(n, n) for n in sinks]
+        return screens, mics, sysaud, outs
+
+    @staticmethod
+    def _combo_pick(combo, label_to_value, fallback):
+        """Текущее значение выпадашки → реальное value (по label)."""
+        return label_to_value.get(combo.get(), fallback)
 
     # ── экран «подключиться» ──────────────────────────────────────────────
     def _show_connect(self):
@@ -164,25 +201,31 @@ class App:
         _label(rcol, "Имя").pack(fill="x", pady=(10, 2))
         self.f_name = _entry(rcol); self.f_name.insert(0, self.args.name); self.f_name.pack(fill="x", ipady=4)
 
-        # аудио-устройства
-        sources, sinks = self._get_audio_devices()
+        # ── источники захвата ────────────────────────────────────────────
+        screens, mics, sysaud, outs = self._enum_sources()
+
+        def src_combo(parent, items, cur_value):
+            labels = [l for l, _ in items]
+            vmap = {l: v for l, v in items}
+            init = next((l for l, v in items if v == cur_value),
+                        labels[0] if labels else "")
+            c = _combo(parent, labels, init)
+            c.configure(state="readonly")
+            c.pack(fill="x", ipady=3)
+            return c, vmap
+
+        # что показывать (экран/камера) — крупно, на всю ширину
+        _label(self.body, "🖥  Что показывать").pack(fill="x", pady=(12, 2))
+        self.f_screen, self._screen_map = src_combo(self.body, screens, self.args.screen_source)
+
+        # микрофон | вывод (наушники)
         audio_row = tk.Frame(self.body, bg=C["bg"]); audio_row.pack(fill="x")
         mcol = tk.Frame(audio_row, bg=C["bg"]); mcol.pack(side="left", fill="x", expand=True, padx=(0, 6))
         scol = tk.Frame(audio_row, bg=C["bg"]); scol.pack(side="left", fill="x", expand=True, padx=(6, 0))
-
         _label(mcol, "🎤 Микрофон").pack(fill="x", pady=(10, 2))
-        mic_init = self.args.mic_source if self.args.mic_source in sources else (sources[0] if sources else "default")
-        self.f_mic = _combo(mcol, sources, mic_init)
-        self.f_mic.pack(fill="x", ipady=3)
-
-        _label(scol, "🎧 Наушники / колонки").pack(fill="x", pady=(10, 2))
-        sink_init = self.args.play_sink if self.args.play_sink in sinks else (sinks[0] if sinks else "")
-        self.f_sink = _combo(scol, sinks, sink_init or "")
-        self.f_sink.pack(fill="x", ipady=3)
-
-        # кнопка обновить список устройств
-        _btn(self.body, "↻ Обновить список устройств", self._refresh_audio_combos,
-             C["card"], "#404249", font=FONT_SM).pack(fill="x", pady=(4, 0))
+        self.f_mic, self._mic_map = src_combo(mcol, mics, self.args.mic_source)
+        _label(scol, "🎧 Слышать в").pack(fill="x", pady=(10, 2))
+        self.f_sink, self._out_map = src_combo(scol, outs, self.args.play_sink)
 
         # звук системы
         self.sys_on = tk.BooleanVar(value=not self.args.no_system_audio)
@@ -191,8 +234,14 @@ class App:
                             selectcolor=C["field"], activebackground=C["bg"],
                             activeforeground=C["text"], anchor="w", bd=0, highlightthickness=0)
         sc.pack(fill="x", pady=(12, 2))
-        self.f_sys = _entry(self.body); self.f_sys.insert(0, self.args.system_source)
-        self.f_sys.pack(fill="x", ipady=3)
+        self.f_sys, self._sys_map = src_combo(self.body, sysaud, self.args.system_source)
+        if IS_MAC and not find_blackhole()[0]:
+            _label(self.body, "нужен BlackHole — нажми «🔊 Звук системы» ниже",
+                   fg=C["muted"], font=FONT_SM).pack(fill="x", pady=(2, 0))
+
+        # обновить список устройств
+        _btn(self.body, "🔄 Обновить устройства", self._refresh_audio_combos,
+             C["card"], "#404249", font=FONT_SM).pack(fill="x", pady=(8, 0))
 
         # режим (сегмент)
         _label(self.body, "Качество демонстрации").pack(fill="x", pady=(14, 4))
@@ -202,39 +251,48 @@ class App:
 
         # кнопка входа
         _btn(self.body, "Войти в канал", self._connect, C["green"], C["green_hi"],
-             font=("DejaVu Sans", 12, "bold")).pack(fill="x", pady=(18, 6), ipady=2)
+             font=(_UI, 13, "bold")).pack(fill="x", pady=(18, 6), ipady=2)
 
-        # утилита анти-эхо
-        _btn(self.body, "🎚 Анти-эхо", self._do_setup_sink, C["card"], "#404249",
-             font=FONT_SM).pack(fill="x")
+        # утилита: настройка звука системы
+        _btn(self.body, "🔊 Звук системы" if IS_MAC else "🎚 Анти-эхо",
+             self._do_setup_sink, C["card"], "#404249", font=FONT_SM).pack(fill="x")
 
     def _render_segment(self, parent, live: bool):
         for w in parent.winfo_children():
             w.destroy()
-        defs = [("quality", "🎬 Качество", "1080p · 60"), ("fps", "⚡ ФПС", "720p · 60")]
+        if IS_MAC:
+            defs = [("quality", "🎬 Качество", "плавно · 60 fps"),
+                    ("fps", "⚡ Легче", "30 fps · меньше CPU")]
+        else:
+            defs = [("quality", "🎬 Качество", "1080p · 60"), ("fps", "⚡ ФПС", "720p · 30")]
         for key, title, sub in defs:
             active = self.mode.get() == key
             cell = tk.Frame(parent, bg=C["accent"] if active else C["card"], cursor="hand2")
             cell.pack(side="left", expand=True, fill="both", padx=(0 if key == "quality" else 6, 0))
             tk.Label(cell, text=title, bg=cell["bg"], fg="#ffffff" if active else C["text"],
-                     font=("DejaVu Sans", 11, "bold")).pack(pady=(8, 0))
+                     font=(_UI, 12, "bold")).pack(pady=(8, 0))
             tk.Label(cell, text=sub, bg=cell["bg"], fg="#dbdee1" if active else C["muted"],
                      font=FONT_SM).pack(pady=(0, 8))
             for wdg in (cell, *cell.winfo_children()):
                 wdg.bind("<Button-1>", lambda e, k=key, lv=live: self._pick_mode(k, lv))
 
     def _refresh_audio_combos(self):
-        sources, sinks = self._get_audio_devices()
-        if hasattr(self, "f_mic") and self.f_mic.winfo_exists():
-            cur_mic = self.f_mic.get()
-            self.f_mic["values"] = sources
-            if cur_mic not in sources and sources:
-                self.f_mic.set(sources[0])
-        if hasattr(self, "f_sink") and self.f_sink.winfo_exists():
-            cur_sink = self.f_sink.get()
-            self.f_sink["values"] = sinks
-            if cur_sink not in sinks and sinks:
-                self.f_sink.set(sinks[0])
+        screens, mics, sysaud, outs = self._enum_sources()
+
+        def upd(combo, map_attr, items):
+            if not (combo and combo.winfo_exists()):
+                return
+            labels = [l for l, _ in items]
+            cur = combo.get()
+            combo["values"] = labels
+            setattr(self, map_attr, {l: v for l, v in items})
+            if cur not in labels and labels:
+                combo.set(labels[0])
+
+        upd(getattr(self, "f_screen", None), "_screen_map", screens)
+        upd(getattr(self, "f_mic", None), "_mic_map", mics)
+        upd(getattr(self, "f_sys", None), "_sys_map", sysaud)
+        upd(getattr(self, "f_sink", None), "_out_map", outs)
 
     def _pick_mode(self, key, live):
         if self.mode.get() == key:
@@ -251,7 +309,7 @@ class App:
         self._clear_body()
 
         tk.Label(self.body, text="В ЭФИРЕ", bg=C["bg"], fg=C["muted"],
-                 font=("DejaVu Sans", 9, "bold")).pack(fill="x", pady=(8, 4))
+                 font=(_UI, 10, "bold")).pack(fill="x", pady=(8, 4))
         listwrap = tk.Frame(self.body, bg=C["dark"])
         listwrap.pack(fill="both", expand=False, ipady=2)
         self.peers_box = tk.Listbox(listwrap, bg=C["dark"], fg=C["text"], font=FONT,
@@ -297,13 +355,17 @@ class App:
         a.password = self.f_pass.get()
         a.room = self.f_room.get().strip() or "general"
         a.name = self.f_name.get().strip() or "Боец"
-        a.mic_source = self.f_mic.get().strip() or "default"
-        a.play_sink = self.f_sink.get().strip() or None
-        a.system_source = self.f_sys.get().strip() or "@DEFAULT_MONITOR@"
-        a.no_system_audio = not self.sys_on.get()
+        a.screen_source = self._combo_pick(self.f_screen, self._screen_map,
+                                           a.screen_source)
+        a.mic_source = self._combo_pick(self.f_mic, self._mic_map, a.mic_source)
+        a.play_sink = self._combo_pick(self.f_sink, self._out_map, None)
+        sys_val = self._combo_pick(self.f_sys, self._sys_map, "")
+        a.system_source = sys_val
+        a.no_system_audio = not self.sys_on.get() or not sys_val
         a.mode = self.mode.get()
         a.width = a.height = a.fps = None
         apply_mode_defaults(a)
+        apply_source_defaults(a)
 
         self._show_call()
         self._set_state("connecting", "подключаюсь…")
@@ -323,12 +385,6 @@ class App:
             self.engine.set_mic(self.mic_on)
 
     def _do_setup_sink(self):
-        if not messagebox.askyesno("Анти-эхо",
-                                   "Создать виртуальный приёмник 'bb_stream' для "
-                                   "трансляции звука игры без эха?\n\n"
-                                   "Потом в pavucontrol переведите звук игры на 'BB_Stream' "
-                                   "и укажите источник bb_stream.monitor."):
-            return
         import io
         import contextlib
         buf = io.StringIO()
@@ -337,9 +393,8 @@ class App:
                 setup_sink()
             except Exception as e:  # noqa: BLE001
                 print(f"Ошибка: {e}")
-        self.f_sys.delete(0, "end")
-        self.f_sys.insert(0, "bb_stream.monitor")
-        self._text_popup("Анти-эхо", buf.getvalue())
+        self._refresh_audio_combos()  # вдруг BlackHole только что появился
+        self._text_popup("Звук системы" if IS_MAC else "Анти-эхо", buf.getvalue())
 
     def _text_popup(self, title, text):
         top = tk.Toplevel(self.root, bg=C["bg"])
